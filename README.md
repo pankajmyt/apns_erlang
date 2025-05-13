@@ -1,20 +1,19 @@
 
-Apns Erlang
-=======
+# Apns Erlang
 
 Provider for Apple Push Notificaion services (APNs)
 
 ## Supports
+
 - OTP 27
 - Apns token key file based auth. For older auths look for version < 2.8.0
 
-### How to compile:
+### How to run
 
-Clone into `apns` uses `erlang.mk`. To compile
+- Clone into folder `apns`
+- Edit config/sys.config & `make run`
 
-    $ make rel
-    
-### How to use with rebar:
+### How to use with rebar
 
 You can use `apns_erlang` as a dependency in your rebar.config:
 
@@ -22,49 +21,50 @@ You can use `apns_erlang` as a dependency in your rebar.config:
         {apns, ".*", {git, "https://github.com/pankajsoni19/apns_erlang", {tag, "3.0.0"}}}
     ]}.
 
-### How to run the configure:
+### How to run the configure
 
-```
+```erlang
 {
 ...
-	{apns, [
-      	{env, development | production},
-      	{token_keyfile,    "p8 file path"},
-      	{token_kid,        "team_kid"},
-      	{team_id,          "team_id"},
-      	{feedback,         {Module, Function}},
+ {apns, [
+   {env, development | production},
+   {token_keyfile,    "p8 file path"},
+   {token_kid,        "team_kid"},
+   {team_id,          "team_id"},
+   {feedback,         {Module, Function}},
 
-		default_headers...
-    ]},
-	}
+   default_headers...
+     ]},
+ }
 }
 ```
 
-### How to use:
-```
+### How to use
+
+```erlang
+
 payload() ->
-	#{
-		aps => #{
-			alert => #{
-				title => <<"hi">>
-			}
-		}
-	}.
+ #{
+  aps => #{
+   alert => #{
+    title => <<"hi">>
+   }
+  }
+ }.
 
 default_headers() ->
-	#{
-		apns_id 			=> apns_connection:new_apns_id(),
-		apns_expiration		=> <<"0">>,
-		apns_priority 		=> <<"10">>,
-		apns_topic 		=> <<"app bundle id">>,
-		apns_push_type		=> <<"alert">>,
-		apns_collapse_id	=> <<"collapse-key">>
-	}.
+ #{
+  apns_id    => apns_connection:new_apns_id(),
+  apns_expiration  => <<"0">>,
+  apns_priority   => <<"10">>,
+  apns_topic   => <<"app bundle id">>,
+  apns_push_type  => <<"alert">>,
+  apns_collapse_id => <<"collapse-key">>
+ }.
 apns:connect(token, ProcName).
 apns:push_notification(ProcName, DeviceId, payload(), default_headers()).
 apns:close_connection(ProcName).
 ```
-    
 
 ### Feedback
 
@@ -74,9 +74,12 @@ All tokens get a feedback call.
 Module:Function(ProcName, ApnsId, Status: number, Reason: string).
 ```
 
-* Status -> [Apns Status Response Codes](https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns)
-* Reason default -> <<"">> or `Error string` column from Status
+- Status -> [Apns Status Response Codes](https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns)
+- Reason default -> <<"">> or `Error string` column from Status
 
+### Links
+
+- [handling-notification-responses-from-apns](https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns)
 
 ----
 
