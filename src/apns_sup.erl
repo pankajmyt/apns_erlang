@@ -20,6 +20,8 @@
 -author("Felipe Ripoll <felipe@inakanetworks.com>").
 -behaviour(supervisor).
 
+-include("apns.hrl").
+
 %% API
 -export([ start_link/0
         , create_connection/1
@@ -57,6 +59,8 @@ create_connection(Connection) ->
 -spec init(any()) ->
   {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
 init([]) ->
+  ets:new(?APNS_CACHE, [set, public, named_table]),
+
   SupFlags = #{ strategy  => simple_one_for_one
               , intensity => 1000
               , period    => 3600

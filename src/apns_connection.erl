@@ -188,7 +188,6 @@ callback_mode() -> state_functions.
      , {next_event, internal, init}
      }.
 init({Connection, Client}) ->
-  quickrand:seed(),
   StateData = #{ connection      => Connection
                , client          => Client
                , backoff         => 1
@@ -245,15 +244,14 @@ connected( cast
 
   Conn = verify_token(Connection),
   Headers1 = add_authorization_header(Headers, auth_token(Conn)),
-  Headers2 = case maps:get(apns_id, Headers1, undefined) of
-    undefined ->
-        Headers1#{apns_id => new_apns_id()};
-    _ ->
-        Headers1
-  end,
+  ApnsId = maps:get(apns_id, Headers1, new_apns_id()),
+  Headers2 = Headers1 #{apns_id => ApnsId},
     
   HdrsList = get_headers(Headers2),
   Path = get_device_path(DeviceId),
+
+  ets:insert(?APNS_CACHE, {ApnsId, DeviceId}),
+
   _StreamRef = gun:post(GunConn, Path, HdrsList, Notification),
 
   StateData1 = StateData#{connection => Conn},
@@ -262,10 +260,27 @@ connected( cast
 connected( info
          , {gun_response, _, _, fin, Status, Headers}
          , StateData) ->
-        
-  % ApnsId = find_header_val(Headers, apns_id),
-  
+    
   ?DEBUG("apns_connection: response1: ~p~n", [{Status, Headers}]),  
+
+  #{connection := Connection} = StateData,
+  #{name := Proc, feedback := Feedback} = Connection,
+  ApnsId = find_header_val(Headers, apns_id),
+  DeviceId = cached_device_id(ApnsId),
+
+  case Feedback of
+      {M, F} ->
+          catch M:F(#{
+                proc      => Proc,
+                apns_id   => ApnsId,
+                device_id => DeviceId,
+                reason    => <<"">>,
+                status    => Status
+              });
+      _ -> 
+        ok
+  end,
+   
   
   {keep_state, StateData};
 
@@ -275,13 +290,21 @@ connected( info
   #{connection := Connection, gun_pid := GunConn} = StateData,
   #{name := Proc, timeout := Timeout, feedback := Feedback} = Connection,
   ApnsId = find_header_val(Headers, apns_id),
+  DeviceId = cached_device_id(ApnsId),
 
   case gun:await_body(GunConn, StreamRef, Timeout) of
       {ok, Body} ->
           ?DEBUG("apns_connection: response2: ~p~n", [{Status, Headers, ApnsId, Body, Feedback}]),
+          
           case Feedback of
             {M, F} ->
-              catch M:F(Proc, ApnsId, Status, decode_reason(Body));
+              catch M:F(#{
+                proc      => Proc,
+                apns_id   => ApnsId,
+                device_id => DeviceId,
+                reason    => decode_reason(Body),
+                status    => Status
+              });
             _ ->
               ok
           end;
@@ -302,6 +325,9 @@ down(internal
        , backoff         := Backoff
        , backoff_ceiling := Ceiling
        }) ->
+
+  ets:delete_all_objects(?APNS_CACHE),
+
   true = demonitor(GunMon, [flush]),
   gun:close(GunPid),
   Client ! {reconnecting, self()},
@@ -349,6 +375,15 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%%===================================================================
 %%% Connection getters/setters Functions
 %%%===================================================================
+%%% 
+cached_device_id(ApnsId) ->
+  DeviceId = case ets:lookup(?APNS_CACHE, ApnsId) of
+    [{_, V}]  -> V;
+    _ -> <<"">>
+  end,
+  ets:delete(?APNS_CACHE, ApnsId),
+  DeviceId.
+
 decode_reason(<<"">>) -> <<"">>;
 decode_reason(Body) -> 
   case catch apns_utils:decode_json(Body) of

@@ -4,7 +4,7 @@ PROJECT_VERSION = $(shell head -n 1 relx.config | awk '{split($$0, a, "\""); pri
 app:: rebar.config
 
 LOCAL_DEPS = inets sasl
-DEPS = gun jsx base64url lager uuid
+DEPS = gun lager uuid
 dep_lager = git https://github.com/erlang-lager/lager 3.9.2
 dep_gun = git https://github.com/ninenines/gun.git 2.2.0
 dep_uuid = git https://github.com/okeuday/uuid.git v2.0.2

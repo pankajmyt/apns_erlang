@@ -11,3 +11,5 @@
 -define(ERROR_MSG(Format, Args), lager:log(error, self(), Format, Args)).
 
 -define(CRITICAL_MSG(Format, Args), lager:log(critical, self(), Format, Args)).
+
+-define(APNS_CACHE, apns_cache).
