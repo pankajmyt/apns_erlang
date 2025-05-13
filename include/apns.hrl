@@ -2,7 +2,6 @@
 
 -define(PRINT(Format, Args), io:format(Format, Args)).
 
-
 -define(DEBUG(Format, Args), lager:log(debug, self(), Format, Args)).
 
 -define(INFO_MSG(Format, Args), lager:log(info, self(), Format, Args)).
