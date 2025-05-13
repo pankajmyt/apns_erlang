@@ -13,7 +13,7 @@ Provider for Apple Push Notificaion services (APNs)
 - Clone into folder `apns`
 - Edit config/sys.config & `make run`
 
-### How to use with rebar
+### Add to project
 
 You can use `apns_erlang` as a dependency in your rebar.config:
 
@@ -21,7 +21,9 @@ You can use `apns_erlang` as a dependency in your rebar.config:
         {apns, ".*", {git, "https://github.com/pankajsoni19/apns_erlang", {tag, "3.0.0"}}}
     ]}.
 
-### How to run the configure
+### Configure
+
+In your sys.config file, add `apns` block.
 
 ```erlang
 {
