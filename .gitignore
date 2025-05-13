@@ -1,4 +1,5 @@
 .eunit
+config/sys.config.example
 *.swo
 *.swp
 .erlang.mk/

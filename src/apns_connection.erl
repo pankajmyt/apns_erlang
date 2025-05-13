@@ -118,40 +118,7 @@ start_link(Connection, Client) ->
 
 %% @doc Builds a connection() map from the environment variables.
 -spec default_connection(type(), name()) -> connection().
-default_connection(certdata, ConnectionName) ->
-  Env = application:get_env(apns, env, development),
-  Port = application:get_env(apns, apple_port, 443),
-  Timeout = application:get_env(apns, timeout, 5000),
-  FeedBack = application:get_env(apns, feedback, undefined),
 
-  {ok, Cert} = application:get_env(apns, certdata),
-  {ok, Key} = application:get_env(apns, keydata),
-
-  #{ name       => ConnectionName
-   , env        => Env
-   , apple_port => Port
-   , certdata   => Cert
-   , keydata    => Key
-   , timeout    => Timeout
-   , feedback   => FeedBack
-  };
-default_connection(cert, ConnectionName) ->
-  Env = application:get_env(apns, env, development),
-  Port = application:get_env(apns, apple_port, 443),
-  Timeout = application:get_env(apns, timeout, 5000),
-  FeedBack = application:get_env(apns, feedback, undefined),
-
-  {ok, Certfile} = application:get_env(apns, certfile),
-  {ok, Keyfile} = application:get_env(apns, keyfile),
-
-  #{ name       => ConnectionName
-   , env        => Env
-   , apple_port => Port
-   , certfile   => Certfile
-   , keyfile    => Keyfile
-   , timeout    => Timeout
-   , feedback   => FeedBack
-  };
 default_connection(token, ConnectionName) ->
   Env = application:get_env(apns, env, development),
   Port = application:get_env(apns, apple_port, 443),
@@ -390,7 +357,7 @@ connected( cast
 connected( info
          , {gun_response, _, _, fin, Status, Headers}
          , #{ queue := Queue} = StateData) ->
-  ?DEBUG("Final packet: ~p~n", [{Status, Headers}]),  
+  ?DEBUG("apns_connection: response: ~p~n", [{Status, Headers}]),  
   ApnsId = find_header_val(Headers, apns_id),
   Queue1 = lists:keydelete(ApnsId, 1, Queue),
   StateData1 = StateData#{queue => Queue1},
@@ -405,7 +372,7 @@ connected( info
   Queue1 = lists:keydelete(ApnsId, 1, Queue),
   case gun:await_body(GunConn, StreamRef, Timeout) of
       {ok, Body} ->
-          ?DEBUG("Received Data: packet: ~p~n", [{Status, Headers, ApnsId, Body, Queue, Feedback}]),
+          ?DEBUG("apns_connection: response: ~p~n", [{Status, Headers, ApnsId, Body, Queue, Feedback}]),
 
           case Feedback of
             {M, F} ->
@@ -416,7 +383,7 @@ connected( info
               ok
           end;
       {error, Reason} ->
-        ?ERROR_MSG("Error Reading Body ~p~n", [{Status, Headers, Reason}])
+        ?ERROR_MSG("apns_connection: error reading body ~p~n", [{Status, Headers, Reason}])
   end,
   StateData1 = StateData#{queue => Queue1},
   {keep_state, StateData1};
@@ -575,7 +542,7 @@ find_header_val(Headers, Key) when is_list(Headers) ->
     _ -> undefined
   end;
 find_header_val(Headers, Key) when is_map(Headers) ->
-  map:get(Key, Headers, undefined).
+  maps:get(Key, Headers, undefined).
 
 -spec get_device_path(apns:device_id()) -> binary().
 get_device_path(DeviceId) ->

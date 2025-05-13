@@ -7,10 +7,7 @@
       {apns_topic,       "topic"}
 
 %%    {backoff_ceiling,  10},      
-%%    {feedback,         {Module, Function}},
-%%    {apple_port,       443},
-%%    {certfile,         "priv/apns-dev-cert.pem"},
-%%    {keyfile,          "priv/apns-dev-key-noenc.pem"},
+%%    {feedback,         {Module, Function}}
     ]},
   {lager, [
       {log_root, "log" },
