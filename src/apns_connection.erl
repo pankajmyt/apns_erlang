@@ -40,6 +40,7 @@
         , close_connection/1
         , push_notification/4
         , wait_apns_connection_up/1
+        , generate_token/4
         ]).
 
 %% gen_statem callbacks
@@ -194,29 +195,15 @@ update_token(#{token_kid := KeyId,
 generate_token(KeyId, TeamId, PrivKey, Iat) ->
   Algorithm = <<"ES256">>,
   Header = jsx:encode([ {alg, Algorithm}
-                      , {typ, <<"JWT">>}
                       , {kid, KeyId}
                       ]),
   Payload = jsx:encode([ {iss, TeamId}
                        , {iat, Iat}
                        ]),
-
   HeaderEncoded = base64url:encode(Header),
   PayloadEncoded = base64url:encode(Payload),
   DataEncoded = <<HeaderEncoded/binary, $., PayloadEncoded/binary>>,
-  
-  {ok, Key} = file:read_file(PrivKey),
-  [ECPrivateKeyPem | _] = public_key:pem_decode(Key),
-
-  ECKey =
-      case public_key:pem_entry_decode(ECPrivateKeyPem) of
-          #'PrivateKeyInfo'{privateKey = ECPrivateKey} -> public_key:der_decode('ECPrivateKey', ECPrivateKey);
-          #'ECPrivateKey'{} = DecKey -> DecKey
-      end,
-      
-  Encoded = public_key:sign(DataEncoded, sha256, ECKey),
-  Signature = base64:encode(Encoded),
-
+  Signature = apns_utils:sign(DataEncoded, PrivKey),
   <<DataEncoded/binary, $., Signature/binary>>.
 
 %% @doc Close the connection with APNs gracefully
@@ -413,19 +400,20 @@ connected( info
          , {gun_response, _, StreamRef, nofin, Status, Headers}
          , StateData) ->
   #{connection := Connection, queue := Queue, gun_pid := GunConn} = StateData,
-  #{timeout := Timeout, feedback := Feedback} = Connection,
+  #{name := Proc, timeout := Timeout, feedback := Feedback} = Connection,
   ApnsId = find_header_val(Headers, apns_id),
   Queue1 = lists:keydelete(ApnsId, 1, Queue),
   case gun:await_body(GunConn, StreamRef, Timeout) of
       {ok, Body} ->
           ?DEBUG("Received Data: packet: ~p~n", [{Status, Headers, ApnsId, Body, Queue, Feedback}]),
-          case {Status, Feedback, proplists:get_value(ApnsId, Queue, ApnsId)} of
-              {400, {M, F}, DeviceId} ->
-                  process_error(Connection, M, F, DeviceId, Body);
-              {410, {M, F}, DeviceId} ->
-                  process_error(Connection, M, F, DeviceId, Body);
-              _ ->
-                  ok
+
+          case Feedback of
+            {M, F} ->
+              catch erlang:apply(M, F, [Proc, 
+                proplists:get_value(ApnsId, Queue, ApnsId), 
+                Status, decode_reason(Body)]);
+            _ ->
+              ok
           end;
       {error, Reason} ->
         ?ERROR_MSG("Error Reading Body ~p~n", [{Status, Headers, Reason}])
@@ -492,20 +480,12 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%%===================================================================
 %%% Connection getters/setters Functions
 %%%===================================================================
-process_error1(Connection, M, F, DeviceId, <<"BadDeviceToken">>, _) ->
-  Timestamp = os:system_time(seconds),
-  catch erlang:apply(M, F, [Connection, DeviceId, Timestamp]);
-
-process_error1(Connection, M, F, DeviceId, <<"Unregistered">>, Timestamp) ->
-  catch erlang:apply(M, F, [Connection, DeviceId, Timestamp]);
-
-process_error1(_, _, _, _, _, _) -> ok.
-
-process_error(#{name := Proc}, M, F, DeviceId, Body) ->
-  BodyJson = jsx:decode(Body, [return_maps]),
-  Reason = maps:get(<<"reason">>, BodyJson, <<"">>),
-  Timestamp = maps:get(<<"timestamp">>, BodyJson, 0),
-  process_error1(Proc, M, F, DeviceId, Reason, Timestamp).
+decode_reason(<<"">>) -> <<"">>;
+decode_reason(Body) -> 
+  case catch jsx:decode(Body, [return_maps]) of
+    #{<<"reason">> := R} -> R;
+    _ -> <<"">>
+  end.
 
 -spec name(connection()) -> name().
 name(#{name := ConnectionName}) ->
