@@ -2,18 +2,15 @@
 Apns Erlang
 =======
 
-<img src="https://media.giphy.com/media/uZQP0PR0BmkGA/giphy.gif" align="right" style="float:right" height="400" />
-
-This lib is intended to allow you to write an APNs provider for [Apple Push Notificaion services (APNs)](https://developer.apple.com/library/content/documentation/NetworkingInternet/Conceptual/RemoteNotificationsPG/APNSOverview.html) over HTTP2 in Erlang.
+Provider for Apple Push Notificaion services (APNs)
 
 Copyright (c) 2017 Erlang Solutions Ltd. <support@inaka.net>, released under the Apache 2 license
 
-__Note:__ Currently it supports push notifications with certificate and authentication token.
+Supports push notifications with certificate.
 
 __BINARY_API:__  This lib supports http2. Check [using Legacy Binary API](https://github.com/softwarejoint/ex_apns)
 
 ## Requirements
-- You must have installed an updated Openssl version or, at least, be sure it supports TLS 1.2+. New APNs server only supports connections over TLS 1.2+.
 - Erlang R21
 
 ### Note:
@@ -25,7 +22,7 @@ https://stackoverflow.com/questions/40301655/voip-push-with-new-token-based-auth
 
 ### How to compile:
 
-`apns_erlang` user `erlang.mk` as make system. To compile
+Clone into `apns` uses `erlang.mk` as make system. To compile
 
     $ make
     
@@ -138,7 +135,7 @@ Feedback function can be specified in the sys.config file.
 It takes the following form.
 
 ```erlang
-M:F(ConnectionName, ApnsId | DeviceId, InValidationTimestamp).
+M:F(ConnectionName, ApnsId | DeviceId, Status: number, Reason: string).
 ```
 
 - `ConnectionName` is apns connection registeration name.
