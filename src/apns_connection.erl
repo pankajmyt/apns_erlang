@@ -79,7 +79,6 @@
                          , client          := pid()
                          , backoff         := non_neg_integer()
                          , backoff_ceiling := non_neg_integer()
-                         , queue           => list()
                          }.
 
 %%%===================================================================
@@ -195,7 +194,6 @@ init({Connection, Client}) ->
                , client          => Client
                , backoff         => 1
                , backoff_ceiling => application:get_env(apns, backoff_ceiling, 10)
-               , queue           => []
                },
   {ok, open_origin, StateData,
     {next_event, internal, init}}.
@@ -244,61 +242,54 @@ connected( cast
          , {push_notification, DeviceId, Notification, Headers}
          , StateData) ->
 
-  #{connection := Connection, queue := Queue, gun_pid := GunConn} = StateData,
+  #{connection := Connection, gun_pid := GunConn} = StateData,
 
   Conn = verify_token(Connection),
   Headers1 = add_authorization_header(Headers, auth_token(Conn)),
-
-  {Queue1, Headers2} = case maps:get(apns_id, Headers1, undefined) of
+  Headers2 = case maps:get(apns_id, Headers1, undefined) of
     undefined ->
-        UUID = new_apns_id(),
-        {
-          lists:sublist([{UUID, DeviceId} | Queue], 100),
-          Headers1#{apns_id => UUID}
-        };
+        Headers1#{apns_id => new_apns_id()};
     _ ->
-        {Queue, Headers1}
+        Headers1
   end,
     
   HdrsList = get_headers(Headers2),
   Path = get_device_path(DeviceId),
   _StreamRef = gun:post(GunConn, Path, HdrsList, Notification),
 
-  StateData1 = StateData#{connection => Conn, queue => Queue1},
+  StateData1 = StateData#{connection => Conn},
   {keep_state, StateData1};
 
 connected( info
          , {gun_response, _, _, fin, Status, Headers}
-         , #{ queue := Queue} = StateData) ->
-  ?DEBUG("apns_connection: response: ~p~n", [{Status, Headers}]),  
-  ApnsId = find_header_val(Headers, apns_id),
-  Queue1 = lists:keydelete(ApnsId, 1, Queue),
-  StateData1 = StateData#{queue => Queue1},
-  {keep_state, StateData1};
+         , StateData) ->
+        
+  % ApnsId = find_header_val(Headers, apns_id),
+  
+  ?DEBUG("apns_connection: response1: ~p~n", [{Status, Headers}]),  
+  
+  {keep_state, StateData};
 
 connected( info
          , {gun_response, _, StreamRef, nofin, Status, Headers}
          , StateData) ->
-  #{connection := Connection, queue := Queue, gun_pid := GunConn} = StateData,
+  #{connection := Connection, gun_pid := GunConn} = StateData,
   #{name := Proc, timeout := Timeout, feedback := Feedback} = Connection,
   ApnsId = find_header_val(Headers, apns_id),
-  Queue1 = lists:keydelete(ApnsId, 1, Queue),
+
   case gun:await_body(GunConn, StreamRef, Timeout) of
       {ok, Body} ->
-          ?DEBUG("apns_connection: response: ~p~n", [{Status, Headers, ApnsId, Body, Queue, Feedback}]),
+          ?DEBUG("apns_connection: response2: ~p~n", [{Status, Headers, ApnsId, Body, Feedback}]),
           case Feedback of
             {M, F} ->
-              catch erlang:apply(M, F, [Proc, 
-                proplists:get_value(ApnsId, Queue, ApnsId), 
-                Status, decode_reason(Body)]);
+              catch M:F(Proc, ApnsId, Status, decode_reason(Body));
             _ ->
               ok
           end;
       {error, Reason} ->
         ?ERROR_MSG("apns_connection: error reading body ~p~n", [{Status, Headers, Reason}])
   end,
-  StateData1 = StateData#{queue => Queue1},
-  {keep_state, StateData1};
+  {keep_state, StateData};
 
 connected(EventType, EventContent, StateData) ->
   handle_common(EventType, EventContent, ?FUNCTION_NAME, StateData, drop).
@@ -423,10 +414,11 @@ get_headers(Headers) ->
   lists:flatmap(F, List).
 
 find_header_val(Headers, apns_id) -> find_header_val(Headers, <<"apns-id">>);
+find_header_val(Headers, apns_unique_id) -> find_header_val(Headers, <<"apns-unique-id">>);
 
 find_header_val(Headers, Key) when is_list(Headers) ->
   case lists:keysearch(Key, 1, Headers) of
-    {value, {Key, Val}} -> Val;
+    {value, {_, Val}} -> Val;
     _ -> undefined
   end;
 find_header_val(Headers, Key) when is_map(Headers) ->
