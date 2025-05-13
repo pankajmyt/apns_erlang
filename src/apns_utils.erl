@@ -24,6 +24,8 @@
         , epoch/0
         , bin_to_hexstr/1
         , seconds_to_timestamp/1
+        , encode_json/1
+        , decode_json/1
         ]).
 
 
@@ -39,6 +41,13 @@ sign(Data, KeyPath) ->
             "' | openssl dgst -binary -sha256 -sign " ++ KeyPath ++ " | base64",
   {0, Result} = apns_os:cmd(Command),
   strip_b64(list_to_binary(Result)).
+
+
+encode_json(Data) ->
+  iolist_to_binary(json:encode(Data)).
+
+decode_json(Binary) ->
+  json:decode(Binary).
 
 %% Retrieves the epoch date.
 -spec epoch() -> integer().

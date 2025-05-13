@@ -107,7 +107,7 @@ push_notification(ConnectionId, DeviceId, JSONMap) ->
                        , headers()
                        ) -> response() | {error, not_connection_owner}.
 push_notification(ConnectionId, DeviceId, JSONMap, Headers) ->
-  Notification = jsx:encode(JSONMap),
+  Notification = apns_utils:encode_json(JSONMap),
   apns_connection:push_notification( ConnectionId
                                    , DeviceId
                                    , Notification

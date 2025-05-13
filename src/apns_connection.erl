@@ -136,14 +136,13 @@ update_token(#{token_kid := KeyId,
 
 generate_token(KeyId, TeamId, PrivKey, Iat) ->
   Algorithm = <<"ES256">>,
-  Header = jsx:encode([ {alg, Algorithm}
-                      , {kid, KeyId}
-                      ]),
-  Payload = jsx:encode([ {iss, TeamId}
-                       , {iat, Iat}
-                       ]),
-  HeaderEncoded = base64url:encode(Header),
-  PayloadEncoded = base64url:encode(Payload),
+
+  Header = apns_utils:encode_json([ {alg, Algorithm}, {kid, KeyId} ]),
+  Payload = apns_utils:encode_json([ {iss, TeamId}, {iat, Iat} ]),
+
+  HeaderEncoded = base64:encode(Header, #{padding => false, mode => urlsafe}),
+  PayloadEncoded = base64:encode(Payload, #{padding => false, mode => urlsafe}),
+  
   DataEncoded = <<HeaderEncoded/binary, $., PayloadEncoded/binary>>,
   Signature = apns_utils:sign(DataEncoded, PrivKey),
   <<DataEncoded/binary, $., Signature/binary>>.
@@ -352,7 +351,7 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%%===================================================================
 decode_reason(<<"">>) -> <<"">>;
 decode_reason(Body) -> 
-  case catch jsx:decode(Body, [return_maps]) of
+  case catch apns_utils:decode_json(Body) of
     #{<<"reason">> := R} -> R;
     _ -> <<"">>
   end.
