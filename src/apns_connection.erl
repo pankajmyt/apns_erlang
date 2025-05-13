@@ -21,7 +21,6 @@
 
 -behaviour(gen_statem).
 
--include_lib("public_key/include/public_key.hrl").
 -include("apns.hrl").
 
 %% API
@@ -31,9 +30,6 @@
         , name/1
         , host/1
         , port/1
-        , certdata/1
-        , certfile/1
-        , keydata/1
         , keyfile/1
         , type/1
         , gun_pid/1
@@ -46,13 +42,9 @@
 %% gen_statem callbacks
 -export([ init/1
         , callback_mode/0
-        , open_connection/3
         , open_origin/3
-        , open_proxy/3
         , open_common/3
         , await_up/3
-        , proxy_connect_to_origin/3
-        , await_tunnel_up/3
         , connected/3
         , down/3
         , code_change/4
@@ -72,25 +64,12 @@
 -type env()          :: development | production.
 -type path()         :: string().
 -type notification() :: binary().
--type type()         :: certdata | cert | token.
--type keydata()      :: {'RSAPrivateKey' | 'DSAPrivateKey' | 'ECPrivateKey' |
-                         'PrivateKeyInfo'
-                        , binary()}.
--type proxy_info()   :: #{ type       := connect
-                         , host       := host()
-                         , port       := inet:port_number()
-                         , username   => iodata()
-                         , password   => iodata()
-                         }.
+-type type()         :: token.
 -type connection()   :: #{ name       := name()
                          , env        := env()
                          , apple_port := inet:port_number()
-                         , certdata   => binary()
-                         , certfile   => path()
-                         , keydata    => keydata()
                          , keyfile    => path()
                          , timeout    => integer()
-                         , proxy_info => proxy_info()
                          }.
 
 -type state()        :: #{ connection      := connection()
@@ -143,14 +122,11 @@ default_connection(token, ConnectionName) ->
 
 verify_token(#{jwt_token := <<"">>} = Connection) ->
   update_token(Connection);
-
 verify_token(#{jwt_iat := Iat} = Connection) ->
   Now = apns_utils:epoch(),
   if (Now - Iat - 3500) > 0 -> update_token(Connection);
      true -> Connection
-  end;
-verify_token(Connection) ->
-  Connection.
+  end.
 
 update_token(#{token_kid := KeyId,
                team_id := TeamId,
@@ -209,7 +185,7 @@ callback_mode() -> state_functions.
 
 -spec init({connection(), pid()})
   -> { ok
-     , open_connection
+     , open_origin
      , State :: state()
      , {next_event, internal, init}
      }.
@@ -221,16 +197,7 @@ init({Connection, Client}) ->
                , backoff_ceiling => application:get_env(apns, backoff_ceiling, 10)
                , queue           => []
                },
-  {ok, open_connection, StateData,
-    {next_event, internal, init}}.
-
--spec open_connection(_, _, _) -> _.
-open_connection(internal, _, #{connection := Connection} = StateData) ->
-  NextState = case proxy(Connection) of
-    #{type := connect} -> open_proxy;
-    undefined          -> open_origin
-  end,
-  {next_state, NextState, StateData,
+  {ok, open_origin, StateData,
     {next_event, internal, init}}.
 
 -spec open_origin(_, _, _) -> _.
@@ -246,18 +213,6 @@ open_origin(internal, _, #{connection := Connection} = StateData) ->
                               , retry          => 0
                               }}}}.
 
--spec open_proxy(_, _, _) -> _.
-open_proxy(internal, _, StateData) ->
-  #{connection := Connection} = StateData,
-  #{type := connect, host := ProxyHost, port := ProxyPort} = proxy(Connection),
-  {next_state, open_common, StateData,
-    {next_event, internal, { ProxyHost
-                           , ProxyPort
-                           , #{ protocols => [http]
-                              , transport => tcp
-                              , retry     => 0
-                              }}}}.
-
 %% This function exists only to make Elvis happy.
 %% I do not think it makes things any easier to read.
 -spec open_common(_, _, _) -> _.
@@ -270,46 +225,10 @@ open_common(internal, {Host, Port, Opts}, StateData) ->
     {state_timeout, 15000, open_timeout}}.
 
 -spec await_up(_, _, _) -> _.
-await_up(info, {gun_up, GunPid, Protocol}, #{gun_pid := GunPid} = StateData) ->
-  #{connection := Connection} = StateData,
-  NextState = case proxy(Connection) of
-    #{type := connect} when Protocol =:= http -> proxy_connect_to_origin;
-    undefined when Protocol =:= http2 -> connected
-  end,
-  {next_state, NextState, StateData,
-    {next_event, internal, on_connect}};
-await_up(EventType, EventContent, StateData) ->
-  handle_common(EventType, EventContent, ?FUNCTION_NAME, StateData, postpone).
-
--spec proxy_connect_to_origin(_, _, _) -> _.
-proxy_connect_to_origin(internal, on_connect, StateData) ->
-  #{connection := Connection, gun_pid := GunPid} = StateData,
-  Host = host(Connection),
-  Port = port(Connection),
-  TransportOpts = transport_opts(Connection),
-  Destination0 = #{ host => Host
-                  , port => Port
-                  , protocol => http2
-                  , transport => tls
-                  , tls_opts => TransportOpts
-                  },
-  Destination = case proxy(Connection) of
-    #{ username := Username, password := Password } ->
-      Destination0#{ username => Username, password => Password };
-    _ ->
-      Destination0
-  end,
-  ConnectRef = gun:connect(GunPid, Destination),
-  {next_state, await_tunnel_up, StateData#{gun_connect_ref => ConnectRef},
-    {state_timeout, 30000, proxy_connect_timeout}}.
-
--spec await_tunnel_up(_, _, _) -> _.
-await_tunnel_up( info
-               , {gun_response, GunPid, ConnectRef, fin, 200, _}
-               , #{gun_pid := GunPid, gun_connect_ref := ConnectRef} = StateData) ->
+await_up(info, {gun_up, GunPid, http2}, #{gun_pid := GunPid} = StateData) ->
   {next_state, connected, StateData,
     {next_event, internal, on_connect}};
-await_tunnel_up(EventType, EventContent, StateData) ->
+await_up(EventType, EventContent, StateData) ->
   handle_common(EventType, EventContent, ?FUNCTION_NAME, StateData, postpone).
 
 -spec connected(_, _, _) -> _.
@@ -327,14 +246,8 @@ connected( cast
 
   #{connection := Connection, queue := Queue, gun_pid := GunConn} = StateData,
 
-  {Conn, Headers1} = case maps:is_key(jwt_token, Connection) of
-    true ->
-      Connection1 = verify_token(Connection),
-      Hdrs = add_authorization_header(Headers, auth_token(Connection1)),
-      {Connection1, Hdrs};
-    false ->
-      {Connection, Headers}
-  end,
+  Conn = verify_token(Connection),
+  Headers1 = add_authorization_header(Headers, auth_token(Conn)),
 
   {Queue1, Headers2} = case maps:get(apns_id, Headers1, undefined) of
     undefined ->
@@ -373,7 +286,6 @@ connected( info
   case gun:await_body(GunConn, StreamRef, Timeout) of
       {ok, Body} ->
           ?DEBUG("apns_connection: response: ~p~n", [{Status, Headers, ApnsId, Body, Queue, Feedback}]),
-
           case Feedback of
             {M, F} ->
               catch erlang:apply(M, F, [Proc, 
@@ -406,7 +318,7 @@ down(internal
   Sleep = backoff(Backoff, Ceiling) * 1000,
   {keep_state_and_data, {state_timeout, Sleep, backoff}};
 down(state_timeout, backoff, StateData) ->
-  {next_state, open_connection, StateData,
+  {next_state, open_origin, StateData,
     {next_event, internal, init}};
 down(EventType, EventContent, StateData) ->
   handle_common(EventType, EventContent, ?FUNCTION_NAME, StateData, postpone).
@@ -467,18 +379,6 @@ host(_) ->
 port(#{apple_port := Port}) ->
   Port.
 
--spec certdata(connection()) -> binary().
-certdata(#{certdata := Cert}) ->
-  Cert.
-
--spec certfile(connection()) -> path().
-certfile(#{certfile := Certfile}) ->
-  Certfile.
-
--spec keydata(connection()) -> keydata().
-keydata(#{keydata := Key}) ->
-  Key.
-
 -spec keyfile(connection()) -> path().
 keyfile(#{keyfile := Keyfile}) ->
   Keyfile.
@@ -487,23 +387,11 @@ keyfile(#{keyfile := Keyfile}) ->
 auth_token(#{jwt_token := Token}) ->
   Token.
 
--spec proxy(connection()) -> proxy_info() | undefined.
-proxy(#{proxy_info := Proxy}) ->
-  Proxy;
-proxy(_) ->
-  undefined.
-
 new_apns_id() ->
   uuid:uuid_to_string(uuid:get_v4(), binary_standard).
 
-type(#{certfile := _}) -> cert;
-type(#{certdata := _}) -> certdata;
 type(_) -> token.
 
-transport_opts(#{certfile := Certfile, keyfile := Keyfile}) ->
-    [{certfile, Certfile}, {keyfile, Keyfile}];
-transport_opts(#{certdata := Cert, keydata:= Key}) ->
-    [{cert, Cert}, {key, Key}];
 transport_opts(_) ->
     CaCertFile = filename:join([code:priv_dir(apns), "GeoTrust_Global_CA.pem"]),
     [{cacertfile, CaCertFile},
@@ -523,7 +411,7 @@ get_headers(Headers) ->
          , {<<"apns-priority">>, apns_priority, <<"5">>}
          , {<<"apns-topic">>, apns_topic, undefined}
          , {<<"apns-push-type">>, apns_push_type, <<"alert">>}
-         , {<<"apns-collapse_id">>, apns_collapse_id, undefined}
+         , {<<"apns-collapse-id">>, apns_collapse_id, undefined}
          , {<<"authorization">>, apns_auth_token, undefined}
          ],
   F = fun({ActualHeader, Key, Def}) ->
