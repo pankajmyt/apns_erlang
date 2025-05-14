@@ -19,9 +19,10 @@
 -module(apns_utils).
 -author("Felipe Ripoll <felipe@inakanetworks.com>").
 
+-include_lib("public_key/include/public_key.hrl").
+
 % API
--export([ sign/2
-        , epoch/0
+-export([ epoch/0
         , encode_json/1
         , decode_json/1
         , generate_token/4
@@ -31,27 +32,38 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
+
+urlencode_digit($/) -> $_;
+urlencode_digit($+) -> $-;
+urlencode_digit(D)  -> D.
+
+base64_encode(Data) ->
+  Data1 = base64_encode_strip(lists:reverse(base64:encode_to_string(Data))),
+  << << (urlencode_digit(D)) >> || <<D>> <= Data1 >>.
+base64_encode_strip([$=|Rest]) ->
+  base64_encode_strip(Rest);
+base64_encode_strip(Result) ->
+  list_to_binary(lists:reverse(Result)).
+
 generate_token(KeyId, TeamId, PrivKey, Iat) ->
-  Algorithm = <<"ES256">>,
 
-  Header = encode_json(#{alg => Algorithm, kid => KeyId}),
-  Payload = encode_json(#{iss => TeamId, iat => Iat}),
+  Header = base64_encode(encode_json(#{alg => <<"ES256">>, kid => KeyId})),
+  Payload = base64_encode(encode_json(#{iss => TeamId, iat => Iat})),
 
-  HeaderEncoded = base64:encode(Header, #{padding => false, mode => urlsafe}),
-  PayloadEncoded = base64:encode(Payload, #{padding => false, mode => urlsafe}),
+  {ok, FileData} = file:read_file(PrivKey),
+
+  ECPrivateKeyPem1 = case public_key:pem_decode(FileData) of
+    [_, ECPrivateKeyPem] -> ECPrivateKeyPem;
+    [ECPrivateKeyPem] -> ECPrivateKeyPem
+  end,
+
+  ECPrivateKey = public_key:pem_entry_decode(ECPrivateKeyPem1),
   
-  DataEncoded = <<HeaderEncoded/binary, $., PayloadEncoded/binary>>,
-  Signature = sign(DataEncoded, PrivKey),
-  <<DataEncoded/binary, $., Signature/binary>>.
+  Input = <<Header/binary, ".", Payload/binary>>,
 
-%% Signs the given binary.
--spec sign(binary(), string()) -> binary().
-sign(Data, KeyPath) ->
-  Command = "printf '" ++
-            binary_to_list(Data) ++
-            "' | openssl dgst -binary -sha256 -sign " ++ KeyPath ++ " | base64",
-  {0, Result} = apns_os:cmd(Command),
-  strip_b64(list_to_binary(Result)).
+  Signature = base64_encode(public_key:sign(Input, sha256, ECPrivateKey)),
+
+  <<Input/binary, ".", Signature/binary>>.
 
 encode_json(Data) ->
   iolist_to_binary(json:encode(Data)).
@@ -64,8 +76,3 @@ decode_json(Binary) ->
 epoch() ->
   {M, S, _} = os:timestamp(),
   M * 1000000 + S.
-
-%% Remove newline and equality characters
--spec strip_b64(binary()) -> binary().
-strip_b64(BS) ->
-  binary:list_to_bin(binary:split(BS, [<<"\n">>, <<"=">>], [global])).
