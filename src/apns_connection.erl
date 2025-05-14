@@ -137,8 +137,8 @@ update_token(#{token_kid := KeyId,
 generate_token(KeyId, TeamId, PrivKey, Iat) ->
   Algorithm = <<"ES256">>,
 
-  Header = apns_utils:encode_json([ {alg, Algorithm}, {kid, KeyId} ]),
-  Payload = apns_utils:encode_json([ {iss, TeamId}, {iat, Iat} ]),
+  Header = apns_utils:encode_json(#{alg => Algorithm, kid => KeyId}),
+  Payload = apns_utils:encode_json(#{iss => TeamId, iat => Iat}),
 
   HeaderEncoded = base64:encode(Header, #{padding => false, mode => urlsafe}),
   PayloadEncoded = base64:encode(Payload, #{padding => false, mode => urlsafe}),
