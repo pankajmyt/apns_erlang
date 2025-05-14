@@ -64,22 +64,9 @@ default_headers() ->
   apns_collapse_id => <<"collapse-key">>
  }.
 apns:connect(token, ProcName).
-apns:push_notification(ProcName, DeviceId, payload(), default_headers()).
+{Status, Headers, no_body} | {Status, Headers, binary()} | { error, Reason} | {error, timeout}
+= apns:push_notification(ProcName, DeviceId, payload(), default_headers()).
 apns:close_connection(ProcName).
-```
-
-### Feedback
-
-All tokens get a feedback call.
-
-```erlang
-Module:Function(#{
-                proc      => ProcName,
-                apns_id   => ApnsId,
-                device_id => DeviceId,
-                reason    => Reason,
-                status    => Status
-              }).
 ```
 
 - Status -> [Apns Status Response Codes](https://developer.apple.com/documentation/usernotifications/handling-notification-responses-from-apns)

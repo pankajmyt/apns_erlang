@@ -22,16 +22,27 @@
 % API
 -export([ sign/2
         , epoch/0
-        , bin_to_hexstr/1
-        , seconds_to_timestamp/1
         , encode_json/1
         , decode_json/1
+        , generate_token/4
         ]).
 
 
 %%%===================================================================
 %%% API
 %%%===================================================================
+generate_token(KeyId, TeamId, PrivKey, Iat) ->
+  Algorithm = <<"ES256">>,
+
+  Header = encode_json(#{alg => Algorithm, kid => KeyId}),
+  Payload = encode_json(#{iss => TeamId, iat => Iat}),
+
+  HeaderEncoded = base64:encode(Header, #{padding => false, mode => urlsafe}),
+  PayloadEncoded = base64:encode(Payload, #{padding => false, mode => urlsafe}),
+  
+  DataEncoded = <<HeaderEncoded/binary, $., PayloadEncoded/binary>>,
+  Signature = sign(DataEncoded, PrivKey),
+  <<DataEncoded/binary, $., Signature/binary>>.
 
 %% Signs the given binary.
 -spec sign(binary(), string()) -> binary().
@@ -41,7 +52,6 @@ sign(Data, KeyPath) ->
             "' | openssl dgst -binary -sha256 -sign " ++ KeyPath ++ " | base64",
   {0, Result} = apns_os:cmd(Command),
   strip_b64(list_to_binary(Result)).
-
 
 encode_json(Data) ->
   iolist_to_binary(json:encode(Data)).
@@ -54,22 +64,6 @@ decode_json(Binary) ->
 epoch() ->
   {M, S, _} = os:timestamp(),
   M * 1000000 + S.
-
-%% Converts binary to hexadecimal string().
--spec bin_to_hexstr(binary()) -> string().
-bin_to_hexstr(Binary) ->
-  L = size(Binary),
-  Bits = L * 8,
-  <<X:Bits/big-unsigned-integer>> = Binary,
-  F = lists:flatten(io_lib:format("~~~B.16.0B", [L * 2])),
-  lists:flatten(io_lib:format(F, [X])).
-
-%% Converts from seconds to datetime.
--spec seconds_to_timestamp(pos_integer()) -> calendar:datetime().
-seconds_to_timestamp(Secs) ->
-  Epoch = 62167219200,
-  calendar:gregorian_seconds_to_datetime(Secs + Epoch).
-
 
 %% Remove newline and equality characters
 -spec strip_b64(binary()) -> binary().

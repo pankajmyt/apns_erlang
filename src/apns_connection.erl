@@ -21,12 +21,9 @@
 
 -behaviour(gen_statem).
 
--include("apns.hrl").
-
 %% API
 -export([ start_link/2
         , default_connection/2
-        , new_apns_id/0
         , name/1
         , host/1
         , port/1
@@ -36,7 +33,6 @@
         , close_connection/1
         , push_notification/4
         , wait_apns_connection_up/1
-        , generate_token/4
         ]).
 
 %% gen_statem callbacks
@@ -50,6 +46,9 @@
         , code_change/4
         ]).
 
+%% for spawn/3
+-export([ reply_errors_and_cancel_timers/2 ]).
+
 -export_type([ name/0
              , host/0
              , port/0
@@ -61,25 +60,36 @@
 
 -type name()         :: atom().
 -type host()         :: string() | inet:ip_address().
--type env()          :: development | production.
 -type path()         :: string().
 -type notification() :: binary().
 -type type()         :: token.
+
 -type connection()   :: #{ name       := name()
-                         , env        := env()
-                         , apple_port := inet:port_number()
                          , keyfile    => path()
                          , timeout    => integer()
+                         , type       := type()
                          }.
 
--type state()        :: #{ connection      := connection()
+-type stream_data() :: #{ from := {pid(), term()}
+                        , stream := gun:stream_ref()
+                        , timer := reference()
+                        , status := non_neg_integer()
+                        , headers := gun:req_headers()
+                        , body := binary()
+                        }.
+
+-opaque state()      :: #{ connection      := connection()
                          , gun_pid         => pid()
+                         , gun_streams     => #{gun:stream_ref() => stream_data()}
+                         , max_gun_streams := non_neg_integer()
                          , gun_monitor     => reference()
                          , gun_connect_ref => reference()
                          , client          := pid()
                          , backoff         := non_neg_integer()
                          , backoff_ceiling := non_neg_integer()
                          }.
+
+-export_type([state/0]).
 
 %%%===================================================================
 %%% API
@@ -96,56 +106,24 @@ start_link(Connection, Client) ->
 
 %% @doc Builds a connection() map from the environment variables.
 -spec default_connection(type(), name()) -> connection().
-
 default_connection(token, ConnectionName) ->
   Env = application:get_env(apns, env, development),
-  Port = application:get_env(apns, apple_port, 443),
   Timeout = application:get_env(apns, timeout, 5000),
-  FeedBack = application:get_env(apns, feedback, undefined),
 
   {ok, PrivKey} = application:get_env(apns, token_keyfile),
   {ok, TokenID} = application:get_env(apns, token_kid),
   {ok, TeamID} = application:get_env(apns, team_id),
-  
+
   #{ name       => ConnectionName
    , env        => Env
-   , apple_port => Port
    , token_kid  => list_to_binary(TokenID)
    , team_id    => list_to_binary(TeamID)
    , token_file => PrivKey
    , jwt_token  => <<"">>
    , jwt_iat    => 0
    , timeout    => Timeout
-   , feedback   => FeedBack
+   , type       => token
   }.
-
-verify_token(#{jwt_token := <<"">>} = Connection) ->
-  update_token(Connection);
-verify_token(#{jwt_iat := Iat} = Connection) ->
-  Now = apns_utils:epoch(),
-  if (Now - Iat - 3500) > 0 -> update_token(Connection);
-     true -> Connection
-  end.
-
-update_token(#{token_kid := KeyId,
-               team_id := TeamId,
-               token_file := PrivKey} = Connection) ->
-  Iat = apns_utils:epoch(),
-  Token = generate_token(KeyId, TeamId, PrivKey, Iat),
-  Connection#{jwt_token => Token, jwt_iat => Iat}.
-
-generate_token(KeyId, TeamId, PrivKey, Iat) ->
-  Algorithm = <<"ES256">>,
-
-  Header = apns_utils:encode_json(#{alg => Algorithm, kid => KeyId}),
-  Payload = apns_utils:encode_json(#{iss => TeamId, iat => Iat}),
-
-  HeaderEncoded = base64:encode(Header, #{padding => false, mode => urlsafe}),
-  PayloadEncoded = base64:encode(Payload, #{padding => false, mode => urlsafe}),
-  
-  DataEncoded = <<HeaderEncoded/binary, $., PayloadEncoded/binary>>,
-  Signature = apns_utils:sign(DataEncoded, PrivKey),
-  <<DataEncoded/binary, $., Signature/binary>>.
 
 %% @doc Close the connection with APNs gracefully
 -spec close_connection(name() | pid()) -> ok.
@@ -161,10 +139,9 @@ gun_pid(ConnectionId) ->
 -spec push_notification( name() | pid()
                        , apns:device_id()
                        , notification()
-                       , apns:headers()) -> ok.
+                       , apns:headers()) -> apns:response() | {error, not_connection_owner}.
 push_notification(ConnectionId, DeviceId, Notification, Headers) ->
-  gen_statem:cast(ConnectionId, {push_notification, DeviceId, Notification, Headers}).
-
+  gen_statem:call(ConnectionId, {push_notification, DeviceId, Notification, Headers}).
 %% @doc Waits until the APNS connection is up.
 %%
 %% Note that this function does not need to be called before
@@ -190,6 +167,8 @@ callback_mode() -> state_functions.
 init({Connection, Client}) ->
   StateData = #{ connection      => Connection
                , client          => Client
+               , gun_streams     => #{}
+               , max_gun_streams => 1
                , backoff         => 1
                , backoff_ceiling => application:get_env(apns, backoff_ceiling, 10)
                },
@@ -200,12 +179,14 @@ init({Connection, Client}) ->
 open_origin(internal, _, #{connection := Connection} = StateData) ->
   Host = host(Connection),
   Port = port(Connection),
-  TransportOpts = transport_opts(Connection),
+  TlsOpts = tls_opts(Connection),
+  Http2Opts = http2_opts(),
   {next_state, open_common, StateData,
     {next_event, internal, { Host
                            , Port
                            , #{ protocols      => [http2]
-                              , tls_opts       => TransportOpts
+                              , http2_opts     => Http2Opts
+                              , tls_opts       => TlsOpts
                               , retry          => 0
                               }}}}.
 
@@ -213,7 +194,6 @@ open_origin(internal, _, #{connection := Connection} = StateData) ->
 %% I do not think it makes things any easier to read.
 -spec open_common(_, _, _) -> _.
 open_common(internal, {Host, Port, Opts}, StateData) ->
-  ?DEBUG("open_common ~p~n", [{Host, Port, Opts}]),
   {ok, GunPid} = gun:open(Host, Port, Opts),
   GunMon = monitor(process, GunPid),
   {next_state, await_up,
@@ -231,88 +211,130 @@ await_up(EventType, EventContent, StateData) ->
 connected(internal, on_connect, #{client := Client}) ->
   Client ! {connection_up, self()},
   keep_state_and_data;
+connected( {call, From}
+         , {push_notification, DeviceId, Notification, Headers0}
+         , StateData) ->
+  #{ connection := Connection0
+   , gun_pid := GunPid
+   , gun_streams := Streams0
+   , max_gun_streams := MaxStreams} = StateData,
+  StreamAllowed = stream_allowed(maps:size(Streams0), MaxStreams),
+  if
+    not StreamAllowed ->
+        {keep_state_and_data, {reply, From, {error, {overload, maps:size(Streams0), MaxStreams}}}};
+    true ->
+      #{timeout := Timeout} = Connection0,
+      Connection = verify_token(Connection0),
+      Headers = add_authorization_header(Headers0, auth_token(Connection0)),
+      StreamRef = send_push(GunPid, DeviceId, Headers, Notification),
+      Tmr = erlang:send_after(Timeout, self(), {timeout, GunPid, StreamRef}),
+      StreamData = #{ from => From
+                    , stream => StreamRef
+                    , timer => Tmr
+                    , status => 200 %% b4 we know real status
+                    , headers => []
+                    , body => <<>> },
+      Streams1 = Streams0#{StreamRef => StreamData},
+      {keep_state, StateData#{gun_streams => Streams1, connection => Connection}}
+  end;
 connected({call, From}, wait_apns_connection_up, _) ->
   {keep_state_and_data, {reply, From, ok}};
 connected({call, From}, Event, _) when Event =/= gun_pid ->
   {keep_state_and_data, {reply, From, {error, bad_call}}};
-
-connected( cast
-         , {push_notification, DeviceId, Notification, Headers}
-         , StateData) ->
-
-  #{connection := Connection, gun_pid := GunConn} = StateData,
-
-  Conn = verify_token(Connection),
-  Headers1 = add_authorization_header(Headers, auth_token(Conn)),
-  ApnsId = maps:get(apns_id, Headers1, new_apns_id()),
-  Headers2 = Headers1 #{apns_id => ApnsId},
-    
-  HdrsList = get_headers(Headers2),
-  Path = get_device_path(DeviceId),
-
-  ets:insert(?APNS_CACHE, {ApnsId, DeviceId}),
-
-  _StreamRef = gun:post(GunConn, Path, HdrsList, Notification),
-
-  StateData1 = StateData#{connection => Conn},
-  {keep_state, StateData1};
-
 connected( info
-         , {gun_response, _, _, fin, Status, Headers}
-         , StateData) ->
-    
-  ?DEBUG("apns_connection: response1: ~p~n", [{Status, Headers}]),  
-
-  #{connection := Connection} = StateData,
-  #{name := Proc, feedback := Feedback} = Connection,
-  ApnsId = find_header_val(Headers, apns_id),
-  DeviceId = cached_device_id(ApnsId),
-
-  case Feedback of
-      {M, F} ->
-          catch M:F(#{
-                proc      => Proc,
-                apns_id   => ApnsId,
-                device_id => DeviceId,
-                reason    => <<"">>,
-                status    => Status
-              });
-      _ -> 
-        ok
-  end,
-   
-  
-  {keep_state, StateData};
-
+         , {gun_response, GunPid, StreamRef, fin, Status, Headers}
+         , #{gun_pid := GunPid} = StateData0) ->
+  %% got response without body
+  #{gun_streams := Streams0} = StateData0,
+  #{StreamRef := StreamData} = Streams0,
+  #{from := From} = StreamData,
+  Streams1 = maps:remove(StreamRef, Streams0),
+  gun:cancel(GunPid, StreamRef), %% final response, closing stream
+  gen_statem:reply(From, {Status, Headers, no_body}),
+  {keep_state, StateData0#{gun_streams => Streams1}};
 connected( info
-         , {gun_response, _, StreamRef, nofin, Status, Headers}
-         , StateData) ->
-  #{connection := Connection, gun_pid := GunConn} = StateData,
-  #{name := Proc, timeout := Timeout, feedback := Feedback} = Connection,
-  ApnsId = find_header_val(Headers, apns_id),
-  DeviceId = cached_device_id(ApnsId),
-
-  case gun:await_body(GunConn, StreamRef, Timeout) of
-      {ok, Body} ->
-          ?DEBUG("apns_connection: response2: ~p~n", [{Status, Headers, ApnsId, Body, Feedback}]),
-          
-          case Feedback of
-            {M, F} ->
-              catch M:F(#{
-                proc      => Proc,
-                apns_id   => ApnsId,
-                device_id => DeviceId,
-                reason    => decode_reason(Body),
-                status    => Status
-              });
-            _ ->
-              ok
-          end;
-      {error, Reason} ->
-        ?ERROR_MSG("apns_connection: error reading body ~p~n", [{Status, Headers, Reason}])
-  end,
-  {keep_state, StateData};
-
+         , {gun_response, GunPid, StreamRef, nofin, Status, Headers}
+         , #{gun_pid := GunPid} = StateData0) ->
+  %% update status & headers
+  #{gun_streams := Streams0} = StateData0,
+  #{StreamRef := StreamState0} = Streams0,
+  StreamState1 = StreamState0#{status => Status, headers => Headers},
+  Streams1 = Streams0#{StreamRef => StreamState1},
+  {keep_state, StateData0#{gun_streams => Streams1}};
+connected( info
+         , {gun_data, GunPid, StreamRef, fin, Data}
+         , #{gun_pid := GunPid} = StateData0) ->
+  %% got data, finally
+  #{gun_streams := Streams0} = StateData0,
+  #{StreamRef := StreamData} = Streams0,
+  #{from := From, status := Status, headers := H, body := B0} = StreamData,
+  Streams1 = maps:remove(StreamRef, Streams0),
+  gun:cancel(GunPid, StreamRef), %% final, closing stream
+  gen_statem:reply(From, {Status, H, <<B0/binary, Data/binary>>}),
+  {keep_state, StateData0#{gun_streams => Streams1}};
+connected( info
+         , {gun_data, GunPid, StreamRef, nofin, Data}
+         , #{gun_pid := GunPid} = StateData0) ->
+  %% add data to buffer, still waiting
+  #{gun_streams := Streams0} = StateData0,
+  #{StreamRef := StreamState0} = Streams0,
+  #{body := B0} = StreamState0,
+  StreamState1 = StreamState0#{body => <<B0/binary, Data/binary>>},
+  Streams1 = Streams0#{StreamRef => StreamState1},
+  {keep_state, StateData0#{gun_streams => Streams1}};
+connected( info
+         , {gun_error, GunPid, StreamRef, Reason}
+         , #{gun_pid := GunPid} = StateData0) ->
+  %% answering with error, remove entry
+  #{gun_streams := Streams0} = StateData0,
+  case maps:get(StreamRef, Streams0, null) of
+    null ->
+      %% nothing todo
+      {keep_state, StateData0};
+    StreamData ->
+      #{from := From} = StreamData,
+      gen_statem:reply(From, {error, Reason}),
+      Streams1 = maps:remove(StreamRef, Streams0),
+      gun:cancel(GunPid, StreamRef),
+      {keep_state, StateData0#{gun_streams => Streams1}}
+    end;
+connected( info
+         , {gun_error, GunPid, Reason}
+         , #{gun_pid := GunPid} = StateData0) ->
+  %% answer with error for all streams, remove all entries, going to reconnect
+  #{gun_streams := Streams} = StateData0,
+  spawn(apns_connection, reply_errors_and_cancel_timers, [Streams, Reason]),
+  {next_state, down, StateData0#{gun_streams => #{}},
+    {next_event, internal, {down, ?FUNCTION_NAME, Reason}}};
+connected( info
+         , {timeout, GunPid, StreamRef}
+         , #{gun_pid := GunPid, gun_streams := Streams0} = StateData0) ->
+  %% gun pid matches, we have to answer {error, timeout}
+  case maps:find(StreamRef, Streams0) of
+    {ok, StreamData} ->
+      #{from := From} = StreamData,
+      gen_statem:reply(From, {error, timeout}),
+      Streams1 = maps:remove(StreamRef, Streams0),
+      gun:cancel(GunPid, StreamRef),
+      {keep_state, StateData0#{gun_streams => Streams1}};
+    error ->
+      %% cant find stream data by stream ref?
+      %% may be just answered and removed,
+      %% ignoring
+      {keep_state, StateData0}
+    end;
+connected(info,
+          {timeout, _GunPid, _StreamRef},
+          StateData0) ->
+  %% timeout from different connection?
+  %% ignoring
+  {keep_state, StateData0};
+connected( info
+         , {gun_notify, GunPid, settings_changed, Settings}
+         , #{gun_pid := GunPid, max_gun_streams := MaxStreams0} = StateData0) ->
+    %% settings received, if contains max_concurrent_streams, update it
+    MaxStreams1 = maps:get(max_concurrent_streams, Settings, MaxStreams0),
+    {keep_state, StateData0#{max_gun_streams => MaxStreams1}};
 connected(EventType, EventContent, StateData) ->
   handle_common(EventType, EventContent, ?FUNCTION_NAME, StateData, drop).
 
@@ -325,9 +347,6 @@ down(internal
        , backoff         := Backoff
        , backoff_ceiling := Ceiling
        }) ->
-
-  ets:delete_all_objects(?APNS_CACHE),
-
   true = demonitor(GunMon, [flush]),
   gun:close(GunPid),
   Client ! {reconnecting, self()},
@@ -347,9 +366,12 @@ handle_common(cast, stop, _, _, _) ->
 handle_common( info
              , {'DOWN', GunMon, process, GunPid, Reason}
              , StateName
-             , #{gun_pid := GunPid, gun_monitor := GunMon} = StateData
+             , #{gun_pid := GunPid, gun_monitor := GunMon} = StateData0
              , _) ->
-  {next_state, down, StateData,
+  %% gun died, answering with errors, cleanup entries
+  #{gun_streams := Streams} = StateData0,
+  spawn(apns_connection, reply_errors_and_cancel_timers, [Streams, Reason]),
+  {next_state, down, StateData0#{gun_streams => #{}},
     {next_event, internal, {down, StateName, Reason}}};
 handle_common( state_timeout
              , EventContent
@@ -375,97 +397,100 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 %%%===================================================================
 %%% Connection getters/setters Functions
 %%%===================================================================
-%%% 
-cached_device_id(ApnsId) ->
-  DeviceId = case ets:lookup(?APNS_CACHE, ApnsId) of
-    [{_, V}]  -> V;
-    _ -> <<"">>
-  end,
-  ets:delete(?APNS_CACHE, ApnsId),
-  DeviceId.
-
-decode_reason(<<"">>) -> <<"">>;
-decode_reason(Body) -> 
-  case catch apns_utils:decode_json(Body) of
-    #{<<"reason">> := R} -> R;
-    _ -> <<"">>
+verify_token(#{jwt_token := <<"">>} = Connection) ->
+  update_token(Connection);
+verify_token(#{jwt_iat := Iat} = Connection) ->
+  Now = apns_utils:epoch(),
+  if (Now - Iat - 3500) > 0 -> update_token(Connection);
+     true -> Connection
   end.
+
+update_token(#{token_kid := KeyId,
+               team_id := TeamId,
+               token_file := PrivKey} = Connection) ->
+  Iat = apns_utils:epoch(),
+  Token = apns_utils:generate_token(KeyId, TeamId, PrivKey, Iat),
+  Connection#{jwt_token => Token, jwt_iat => Iat}.
 
 -spec name(connection()) -> name().
 name(#{name := ConnectionName}) ->
   ConnectionName.
 
+-spec host(connection()) -> host().
 host(#{env := development}) ->
   "api.development.push.apple.com";
 host(_) ->
   "api.push.apple.com".
 
 -spec port(connection()) -> inet:port_number().
-port(#{apple_port := Port}) ->
-  Port.
+port(_) -> 443.
 
 -spec keyfile(connection()) -> path().
 keyfile(#{keyfile := Keyfile}) ->
   Keyfile.
 
--spec auth_token(connection()) -> binary().
-auth_token(#{jwt_token := Token}) ->
-  Token.
+-spec type(connection()) -> type().
+type(#{type := Type}) ->
+  Type.
 
-new_apns_id() ->
-  uuid:uuid_to_string(uuid:get_v4(), binary_standard).
-
-type(_) -> token.
-
-transport_opts(_) ->
-    CaCertFile = filename:join([code:priv_dir(apns), "GeoTrust_Global_CA.pem"]),
-    [{cacertfile, CaCertFile},
-     {server_name_indication, disable},
+tls_opts(_) ->
+  % CaCertFile = filename:join([code:priv_dir(apns), "GeoTrust_Global_CA.pem"]),
+    [{server_name_indication, disable},
      {crl_check, false},
      {verify, verify_none}].
+
+http2_opts() ->
+      %% we need to know settings (from APN server), gun expects map
+      #{notify_settings_changed => true}.
 
 %%%===================================================================
 %%% Internal Functions
 %%%===================================================================
 
+-spec(stream_allowed(StreamsCount :: non_neg_integer(),
+                     MaxStreams :: non_neg_integer() | infinity) ->
+    boolean()).
+stream_allowed(_StreamsCount, infinity) -> true;
+stream_allowed(StreamsCount, MaxStreams) ->
+  StreamsCount < MaxStreams.
+
 
 -spec get_headers(apns:headers()) -> list().
 get_headers(Headers) ->
-  List = [ {<<"apns-id">>, apns_id, undefined}
-         , {<<"apns-expiration">>, apns_expiration, <<"0">>}
-         , {<<"apns-priority">>, apns_priority, <<"5">>}
-         , {<<"apns-topic">>, apns_topic, undefined}
-         , {<<"apns-push-type">>, apns_push_type, <<"alert">>}
-         , {<<"apns-collapse-id">>, apns_collapse_id, undefined}
-         , {<<"authorization">>, apns_auth_token, undefined}
+  List = [ {<<"apns-id">>, apns_id}
+         , {<<"apns-expiration">>, apns_expiration}
+         , {<<"apns-priority">>, apns_priority}
+         , {<<"apns-topic">>, apns_topic}
+         , {<<"apns-collapse-id">>, apns_collapse_id}
+         , {<<"apns-push-type">>, apns_push_type}
+         , {<<"authorization">>, apns_auth_token}
          ],
-  F = fun({ActualHeader, Key, Def}) ->
-      case {Key, maps:get(Key, Headers, Def)} of
-          {_, undefined} -> [];
-          {_, Value} -> [{ActualHeader, Value}]
+  F = fun({ActualHeader, Key}) ->
+    case maps:find(Key, Headers) of
+      error -> [];
+      {ok, Value} -> [{ActualHeader, Value}]
     end
   end,
   lists:flatmap(F, List).
-
-find_header_val(Headers, apns_id) -> find_header_val(Headers, <<"apns-id">>);
-find_header_val(Headers, apns_unique_id) -> find_header_val(Headers, <<"apns-unique-id">>);
-
-find_header_val(Headers, Key) when is_list(Headers) ->
-  case lists:keysearch(Key, 1, Headers) of
-    {value, {_, Val}} -> Val;
-    _ -> undefined
-  end;
-find_header_val(Headers, Key) when is_map(Headers) ->
-  maps:get(Key, Headers, undefined).
 
 -spec get_device_path(apns:device_id()) -> binary().
 get_device_path(DeviceId) ->
   <<"/3/device/", DeviceId/binary>>.
 
--spec add_authorization_header(apns:headers(), apnd:token()) -> apns:headers().
+-spec auth_token(connection()) -> binary().
+auth_token(#{jwt_token := Token}) ->
+  Token.
+
+-spec add_authorization_header(apns:headers(), apns:token()) -> apns:headers().
 add_authorization_header(Headers, Token) ->
   Headers#{apns_auth_token => <<"bearer ", Token/binary>>}.
 
+-spec send_push(pid(), apns:device_id(), apns:headers(), notification()) ->
+  gun:stream_ref().
+send_push(GunPid, DeviceId, HeadersMap, Notification) ->
+  Headers = get_headers(HeadersMap),
+  Path = get_device_path(DeviceId),
+  gun:post(GunPid, Path, Headers, Notification).
 
 -spec backoff(non_neg_integer(), non_neg_integer()) -> non_neg_integer().
 backoff(N, Ceiling) ->
@@ -476,3 +501,18 @@ backoff(N, Ceiling) ->
       NString = float_to_list(NextN, [{decimals, 0}]),
       list_to_integer(NString)
   end.
+
+%%%===================================================================
+%%% spawn/3 functions
+%%%===================================================================
+-spec reply_errors_and_cancel_timers(map(), term()) -> ok.
+reply_errors_and_cancel_timers(Streams, Reason) ->
+  [reply_error_and_cancel_timer(From, Reason, Tmr) ||
+    #{from := From, timer := Tmr} <- maps:values(Streams)],
+  ok.
+
+-spec reply_error_and_cancel_timer(From :: {pid(), term()}, Reason :: term(),
+                                   Tmr :: reference()) -> ok.
+reply_error_and_cancel_timer(From, Reason, Tmr) ->
+    erlang:cancel_timer(Tmr),
+    gen_statem:reply(From, {error, Reason}).

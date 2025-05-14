@@ -5,9 +5,6 @@
       {token_kid,        "team_kid"},
       {team_id,          "team_id"},
       {apns_topic,       "topic"}
-
-%%    {backoff_ceiling,  10},      
-%%    {feedback,         {Module, Function}}
     ]},
   {lager, [
       {log_root, "log" },
